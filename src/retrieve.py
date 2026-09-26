@@ -28,7 +28,10 @@ class MeetingResult:
     hits: list[MeetingHit] = field(default_factory=list)
     error: str | None = None
 
-    def as_context(self, max_chars: int = 6000) -> str:
+    def as_context(self, max_chars: int | None = None) -> str:
+        # Scale with hit count so a high top_k is not silently truncated.
+        if max_chars is None:
+            max_chars = min(14000, max(6000, len(self.hits) * 900))
         parts: list[str] = []
         used = 0
         for h in self.hits:

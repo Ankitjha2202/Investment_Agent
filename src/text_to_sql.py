@@ -58,9 +58,8 @@ class SqlResult:
     error: str | None = None
 
 
-def generate_sql(question: str) -> tuple[str | None, str | None, str | None]:
-    """Returns (sql, rationale, error)."""
-    raw = chat_json(SCHEMA_PROMPT, f"Question: {question}")
+def _parse_sql_response(raw: str) -> tuple[str | None, str | None, str | None]:
+    """Parse model JSON into (sql, rationale, error)."""
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -69,7 +68,41 @@ def generate_sql(question: str) -> tuple[str | None, str | None, str | None]:
     rationale = data.get("rationale")
     if not sql:
         return None, rationale, "No sql field in model response"
-    return sql, rationale, None
+    return str(sql), (str(rationale) if rationale is not None else None), None
+
+
+def generate_sql(
+    question: str,
+    *,
+    feedback: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Returns (sql, rationale, error)."""
+    user = f"Question: {question}"
+    if feedback:
+        user += (
+            "\n\nPipeline critic feedback from a prior attempt — apply these fixes:\n"
+            f"{feedback}"
+        )
+    raw = chat_json(SCHEMA_PROMPT, user)
+    return _parse_sql_response(raw)
+
+
+def repair_sql(
+    question: str,
+    *,
+    failed_sql: str | None,
+    error: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Ask the model to fix a failed / empty query. Returns (sql, rationale, error)."""
+    user = (
+        f"Question: {question}\n\n"
+        f"Previous SQL:\n{failed_sql or '(none generated)'}\n\n"
+        f"Problem: {error}\n\n"
+        "Fix the query. Keep the same JSON shape: "
+        '{"sql": "<single SELECT>", "rationale": "<what you changed>"}'
+    )
+    raw = chat_json(SCHEMA_PROMPT, user)
+    return _parse_sql_response(raw)
 
 
 def execute_sql(sql: str) -> SqlResult:
@@ -91,10 +124,74 @@ def execute_sql(sql: str) -> SqlResult:
         return SqlResult(sql=safe_sql, error=f"Execution error: {e}")
 
 
-def answer_with_sql(question: str) -> SqlResult:
-    sql, rationale, err = generate_sql(question)
+def _needs_repair(result: SqlResult) -> str | None:
+    """Return a repair hint if the result should be retried, else None."""
+    if result.error:
+        return result.error
+    if not result.rows:
+        return (
+            "Query returned 0 rows. If the question implies matching data exists, "
+            "fix filters, joins, column names, or date/status predicates."
+        )
+    return None
+
+
+def answer_with_sql(
+    question: str,
+    *,
+    max_attempts: int = 2,
+    feedback: str | None = None,
+) -> SqlResult:
+    """Generate + execute SQL, with one self-correction retry on failure/empty.
+
+    ``feedback`` is optional critic guidance from the graph-level heal loop.
+    ``max_attempts`` caps generate+repair cycles (2 ⇒ one repair pass).
+    """
+    sql, rationale, err = generate_sql(question, feedback=feedback)
     if err or not sql:
-        return SqlResult(rationale=rationale, error=err or "SQL generation failed")
+        if max_attempts < 2:
+            return SqlResult(rationale=rationale, error=err or "SQL generation failed")
+        repair_err = err or "SQL generation failed"
+        if feedback:
+            repair_err = f"{repair_err}\nCritic feedback: {feedback}"
+        sql, rationale, err = repair_sql(
+            question,
+            failed_sql=None,
+            error=repair_err,
+        )
+        if err or not sql:
+            return SqlResult(rationale=rationale, error=err or "SQL generation failed")
+
     result = execute_sql(sql)
     result.rationale = rationale
+
+    hint = _needs_repair(result)
+    if not hint or max_attempts < 2:
+        return result
+
+    if feedback:
+        hint = f"{hint}\nCritic feedback: {feedback}"
+
+    sql2, rationale2, err2 = repair_sql(
+        question,
+        failed_sql=result.sql or sql,
+        error=hint,
+    )
+    if err2 or not sql2:
+        return result
+
+    repaired = execute_sql(sql2)
+    note = rationale2 or rationale or ""
+    if note and "repair" not in note.lower():
+        note = f"{note} (repaired after: {hint[:120]})"
+    elif not note:
+        note = f"Repaired after: {hint[:120]}"
+    repaired.rationale = note
+
+    # Prefer a successful repair. If repair fails but the first attempt only
+    # returned empty rows (no error), keep the first valid empty result.
+    if not repaired.error:
+        return repaired
+    if result.error:
+        return repaired
     return result

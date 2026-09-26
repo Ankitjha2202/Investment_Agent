@@ -1,14 +1,15 @@
-"""End-to-end chat orchestration: route → retrieve/SQL → synthesize."""
+"""Public chat API — invoke the LangGraph agent and shape the UI response."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
-from src.retrieve import MeetingResult, retrieve_meetings
-from src.router import RouteDecision, route_question
-from src.synthesize import synthesize
-from src.text_to_sql import SqlResult, answer_with_sql
+from src.graph import agent_graph
+from src.retrieve import MeetingResult
+from src.text_to_sql import SqlResult
+
+StepCallback = Callable[[str, str, str], None]
 
 
 @dataclass
@@ -19,47 +20,94 @@ class ChatResponse:
     sql: SqlResult | None = None
     meetings: MeetingResult | None = None
     debug: dict[str, Any] = field(default_factory=dict)
+    plan: list[dict[str, Any]] = field(default_factory=list)
 
 
-def ask(question: str, *, show_debug: bool = True) -> ChatResponse:
-    decision: RouteDecision = route_question(question)
+def _serialize_sql(result: SqlResult | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    return {
+        "query": result.sql,
+        "rationale": result.rationale,
+        "error": result.error,
+        "row_count": len(result.rows),
+        "columns": result.columns,
+        "sample_rows": result.rows[:10],
+    }
 
-    sql_result: SqlResult | None = None
-    meeting_result: MeetingResult | None = None
 
-    if decision.route in {"sql", "both"}:
-        sql_result = answer_with_sql(question)
+def _serialize_meetings(result: MeetingResult | None) -> dict[str, Any] | None:
+    if result is None:
+        return None
+    return {
+        "error": result.error,
+        "hit_count": len(result.hits),
+        "hits": [
+            {
+                "meeting_id": h.meeting_id,
+                "score": round(h.score, 4),
+                "meeting_date": h.meeting_date,
+                "company": h.company,
+                "sector": h.sector,
+                "region": h.region,
+                "client_id": h.client_id,
+                "summary": (h.summary or "")[:280],
+                "action_items": (h.action_items or "")[:180],
+            }
+            for h in result.hits
+        ],
+    }
 
-    if decision.route in {"meetings", "both"}:
-        meeting_result = retrieve_meetings(
-            question, top_k=6, client_id=decision.client_id
-        )
 
-    answer = synthesize(
-        question,
-        route=decision.route,
-        sql_result=sql_result,
-        meeting_result=meeting_result,
+def ask(
+    question: str,
+    *,
+    show_debug: bool = True,
+    on_step: StepCallback | None = None,
+) -> ChatResponse:
+    """Run the LangGraph agent (route → tools → synthesize → improve/heal)."""
+    final = agent_graph.invoke(
+        {
+            "question": question,
+            "retry_count": 0,
+            "max_retries": 2,
+            "improve_history": [],
+            "quality_ok": False,
+            "heal_action": "accept",
+        },
+        config={"configurable": {"on_step": on_step}},
     )
+
+    sql_result = final.get("sql_result")
+    meeting_result = final.get("meeting_result")
+    route = final.get("route") or "both"
+    route_reason = final.get("route_reason") or ""
+    plan = final.get("plan") or []
 
     debug: dict[str, Any] = {}
     if show_debug:
         debug = {
-            "route": decision.route,
-            "route_reason": decision.reason,
-            "client_id": decision.client_id,
-            "sql": sql_result.sql if sql_result else None,
-            "sql_error": sql_result.error if sql_result else None,
-            "sql_rows": len(sql_result.rows) if sql_result else 0,
-            "meeting_hits": len(meeting_result.hits) if meeting_result else 0,
-            "meeting_error": meeting_result.error if meeting_result else None,
+            "route": route,
+            "route_reason": route_reason,
+            "top_k": final.get("top_k"),
+            "client_id": final.get("client_id"),
+            "plan": plan,
+            "retry_count": final.get("retry_count") or 0,
+            "max_retries": final.get("max_retries") or 2,
+            "quality_ok": final.get("quality_ok"),
+            "retrieval_query": final.get("retrieval_query"),
+            "improve_feedback": final.get("improve_feedback"),
+            "improve_history": final.get("improve_history") or [],
+            "sql": _serialize_sql(sql_result),
+            "meetings": _serialize_meetings(meeting_result),
         }
 
     return ChatResponse(
-        answer=answer,
-        route=decision.route,
-        route_reason=decision.reason,
+        answer=final.get("answer") or "",
+        route=route,
+        route_reason=route_reason,
         sql=sql_result,
         meetings=meeting_result,
         debug=debug,
+        plan=plan,
     )

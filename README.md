@@ -2,23 +2,33 @@
 
 Custom hybrid RAG chatbot for natural-language questions over investment, meeting, and performance data — centered on **Client**, **Group**, **Deal**, and **RM**.
 
-Built as a system-design / data-handling exercise (not a framework wrapper).
+Built as a system-design / data-handling exercise for an AI Engineer role —
+hybrid retrieval + LangGraph orchestration (not a thin framework wrapper).
 
 ## Architecture
+
+Orchestration is a **LangGraph** `StateGraph` (`src/graph.py`) so routing, tool
+selection, and synthesis are explicit nodes with conditional edges — easy to
+extend (retries, extra sources, human-in-the-loop) without rewriting a script.
 
 ```
 Question
    │
    ▼
- Router (gpt-4o-mini)  →  sql | meetings | both
-   │
-   ├─ Text-to-SQL  →  guardrails  →  read-only Postgres (investments, performance)
-   │
-   └─ Embed query  →  pgvector cosine search (meeting_notes)
-   │
-   ▼
- Synthesizer (gpt-4o-mini)  →  final answer
+┌──────────────────────────────────────────────────────────────┐
+│  LangGraph agent (self-healing RAG)                          │
+│                                                              │
+│  [assess] ──► sql | meetings | both (+ top_k)                │
+│     │                                                        │
+│     ├─ [sql]        text-to-SQL → guardrails → RO Postgres   │
+│     ├─ [meetings]   embed → pgvector (meeting_notes)         │
+│     ├─ [synthesize] grounded answer from evidence            │
+│     └─ [improve]    critique → accept | retry (≤ 2×)         │
+│                      └─ heal route / top_k / query / feedback│
+└──────────────────────────────────────────────────────────────┘
 ```
+
+![LangGraph pipeline: assess → route → sql/meetings → synthesize → improve (retry ≤ 2)](docs/langgraph-pipeline.png)
 
 | Sheet | Rows | Path |
 |---|---|---|
@@ -56,26 +66,33 @@ streamlit run app.py
 
 ## Key design decisions
 
-1. **Hybrid retrieval, not one tool for everything**  
-   Structured metrics are exact with SQL; free-text meeting notes need semantic search. A router chooses per question.
+1. **LangGraph orchestration + self-healing RAG**  
+   Nodes: `assess` → `sql` / `meetings` → `synthesize` → `improve`, with
+   conditional edges for `sql` | `meetings` | `both`. The improve node critiques
+   evidence/answer and can replan (route, `top_k`, client filter, retrieval query,
+   SQL feedback) for up to **2 retries**. Shared typed state; UI step callbacks
+   via `configurable`.
 
-2. **Text-to-SQL with layered guardrails**  
+2. **Hybrid retrieval, not one tool for everything**  
+   Structured metrics are exact with SQL; free-text meeting notes need semantic search. An assessor chooses route + retrieval depth (`top_k`) per question.
+
+3. **Text-to-SQL with layered guardrails**  
    - `sqlglot` parse → single `SELECT` / `WITH…SELECT` only  
    - Forbidden keyword regex (INSERT/UPDATE/DELETE/DDL…)  
    - Whitelist tables: `investments`, `performance`  
    - Auto `LIMIT` (default 100, max 500)  
    - Execute only via `DATABASE_URL_READONLY` with `default_transaction_read_only=on` and `statement_timeout=15s`
 
-3. **Embeddings: `text-embedding-3-small` (1536-d) + HNSW**  
+4. **Embeddings: `text-embedding-3-small` (1536-d) + HNSW**  
    Cheap (~$0.16 one-time for 20k notes), strong enough for this corpus. HNSW index for low-latency cosine search.
 
-4. **Cheap chat model: `gpt-4o-mini`**  
+5. **Cheap chat model: `gpt-4o-mini`**  
    Used for routing, SQL generation, and synthesis to keep demo cost low.
 
-5. **Normalized snake_case Postgres schema**  
+6. **Normalized snake_case Postgres schema**  
    Excel column names are messy; ETL maps them once so the SQL prompt stays stable.
 
-6. **Synthesis is a separate LLM call**  
+7. **Synthesis is a separate LLM call**  
    Keeps tool outputs inspectable (debug panel) and answers grounded in evidence JSON.
 
 ## Deliberate simplifications (note for reviewers)
@@ -85,7 +102,7 @@ streamlit run app.py
 | `DATABASE_URL_READONLY` may equal write URL | Supabase role setup skipped for speed | Create `chatbot_readonly` with `SELECT` only; point RO URL at it |
 | No auth / multi-tenancy in Streamlit | Demo UI | Add auth + row-level security by RM/client |
 | Router is a single LLM classify call | Simple & transparent | Add deterministic heuristics (keyword → meetings) + confidence |
-| No query caching / conversation memory beyond Streamlit session | Scope | Cache embeddings & SQL for repeated questions; pass chat history |
+| No query caching / conversation memory beyond Streamlit session | Scope | LangGraph checkpoints + thread_id; cache embeddings & SQL |
 | Meeting filter by `client_id` only when router extracts it | Avoid over-filtering | Better entity linking (deal/RM/company) |
 | MOIC kept as text (`'2.3x'`) | Matches source data | Parse to numeric in ETL for better aggregates |
 | No eval harness | Time | Golden question set + faithfulness checks |
@@ -106,9 +123,12 @@ src/
   sql_guardrails.py         # SELECT-only validation
   text_to_sql.py            # generate + execute SQL
   retrieve.py               # pgvector search
-  router.py                 # sql | meetings | both
+  assess.py                 # brain: sql | meetings | both + top_k chunks
+  router.py                 # thin alias → assess (compat)
   synthesize.py             # final answer
-  chat.py                   # orchestration
+  improve.py                # critique + self-heal plan (≤ 2 retries)
+  graph.py                  # ★ full pipeline map (nodes, edges, ASCII diagram)
+  chat.py                   # public ask() → invokes graph
 ```
 
 ## Example questions

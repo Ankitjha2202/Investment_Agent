@@ -47,9 +47,12 @@ def synthesize(
             "context": meeting_result.as_context(),
         }
 
+    # Allow more evidence when many meeting chunks were requested.
+    hit_n = len(meeting_result.hits) if meeting_result and meeting_result.hits else 0
+    budget = min(28000, max(14000, 14000 + hit_n * 600))
     user = (
         "Evidence (JSON):\n"
-        + json.dumps(payload, default=str)[:14000]
+        + json.dumps(payload, default=str)[:budget]
         + "\n\nWrite the final answer for the user."
     )
     return chat_text(SYNTHESIS_SYSTEM, user)
