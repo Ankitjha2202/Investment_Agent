@@ -137,3 +137,13 @@ src/
 - “Which RM has the highest total investment amount?”
 - “What diligence concerns came up for fintech deals in EMEA?”
 - “How is client A12345 performing on IRR, and what was discussed in recent meetings?”
+
+## Future improvements
+
+- **Finance-specific embeddings** — swap general `text-embedding-3-small` for a domain model trained on investment / research text so meeting retrieval ranks diligence language more accurately.
+- **Stronger generation model** — use a higher-capability model for synthesis (and optionally SQL) while keeping a cheaper model for light steps.
+- **Better assessor** — improve route / `top_k` / entity extraction with a stronger or fine-tuned classifier so sql vs meetings vs both is less wrong on edge cases.
+- **Planning layer over assess** — add an explicit planner above the assessor that decomposes multi-part questions into ordered tool steps before retrieval runs.
+- **Hybrid RAG** — combine keyword (BM25 / Postgres FTS) with semantic vector search so exact tickers, client IDs, and deal names are not missed by embeddings alone.
+- **Reranker** — cross-encoder (or LLM) rerank of meeting chunks after hybrid retrieval to keep only the most answer-relevant evidence.
+- **Model routing by query type** — pick models per step/query (e.g. small for assess, domain embedder for meetings, stronger model for hard SQL / synthesis) instead of one model for everything.
